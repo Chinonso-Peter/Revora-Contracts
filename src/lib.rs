@@ -821,6 +821,16 @@ impl AmountValidationMatrix {
     }
 }
 
+/// Normalize page size across read-only pagination endpoints.
+/// `0` means "use the default page size" and oversized requests are capped.
+fn normalized_page_limit(limit: u32) -> u32 {
+    if limit == 0 || limit > MAX_PAGE_LIMIT {
+        MAX_PAGE_LIMIT
+    } else {
+        limit
+    }
+}
+
 // ── Contract ─────────────────────────────────────────────────
 #[contract]
 pub struct RevoraRevenueShare;
@@ -972,7 +982,6 @@ impl RevoraRevenueShare {
         .ok_or(RevoraError::OfferingNotFound)?;
         Ok(offering.payout_asset)
     }
-
     /// Internal helper for revenue deposits.
     /// Validates amount using the Negative Amount Validation Matrix (#163).
     fn do_deposit_revenue(
@@ -994,6 +1003,9 @@ impl RevoraRevenueShare {
             );
             return Err(err);
         }
+        // The token transfer below spends funds from `issuer`, so explicit issuer auth must
+        // be present before we call into the token contract.
+        issuer.require_auth();
 
         let offering_id = OfferingId {
             issuer: issuer.clone(),
@@ -1939,14 +1951,13 @@ impl RevoraRevenueShare {
         let count = Self::get_offering_count(env.clone(), issuer.clone(), namespace.clone());
         let tenant_id = TenantId { issuer, namespace };
 
-        let effective_limit =
-            if limit == 0 || limit > MAX_PAGE_LIMIT { MAX_PAGE_LIMIT } else { limit };
+        let effective_limit = normalized_page_limit(limit);
 
         if start >= count {
             return (Vec::new(&env), None);
         }
 
-        let end = core::cmp::min(start + effective_limit, count);
+        let end = core::cmp::min(start.saturating_add(effective_limit), count);
         let mut results = Vec::new(&env);
 
         for i in start..end {
@@ -3740,6 +3751,10 @@ impl RevoraRevenueShare {
 
     /// Return unclaimed period IDs for a holder on an offering.
     /// Ordering: by deposit index (creation order), deterministic (#38).
+    ///
+    /// Security assumption: this read path only exposes period ids to holders with a non-zero
+    /// configured share. Zero-share holders receive an empty list to avoid leaking offering
+    /// activity through unactionable read-only queries.
     pub fn get_pending_periods(
         env: Env,
         issuer: Address,
@@ -3747,6 +3762,17 @@ impl RevoraRevenueShare {
         token: Address,
         holder: Address,
     ) -> Vec<u64> {
+        let share_bps = Self::get_holder_share(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            holder.clone(),
+        );
+        if share_bps == 0 {
+            return Vec::new(&env);
+        }
+
         let offering_id = OfferingId { issuer, namespace, token };
         let count_key = DataKey::PeriodCount(offering_id.clone());
         let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
@@ -3770,6 +3796,9 @@ impl RevoraRevenueShare {
     /// Returns `(periods_page, next_cursor)` where `next_cursor` is `Some(next_index)` when more
     /// periods remain, otherwise `None`. `limit` of 0 or greater than `MAX_PAGE_LIMIT` will be
     /// capped to `MAX_PAGE_LIMIT` to keep calls predictable.
+    ///
+    /// Security assumption: zero-share holders receive an empty page with no cursor so callers
+    /// cannot infer deposit activity without current entitlement.
     pub fn get_pending_periods_page(
         env: Env,
         issuer: Address,
@@ -3779,6 +3808,17 @@ impl RevoraRevenueShare {
         start: u32,
         limit: u32,
     ) -> (Vec<u64>, Option<u32>) {
+        let share_bps = Self::get_holder_share(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            holder.clone(),
+        );
+        if share_bps == 0 {
+            return (Vec::new(&env), None);
+        }
+
         let offering_id = OfferingId { issuer, namespace, token };
         let count_key = DataKey::PeriodCount(offering_id.clone());
         let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
@@ -3792,9 +3832,8 @@ impl RevoraRevenueShare {
             return (Vec::new(&env), None);
         }
 
-        let effective_limit =
-            if limit == 0 || limit > MAX_PAGE_LIMIT { MAX_PAGE_LIMIT } else { limit };
-        let end = core::cmp::min(actual_start + effective_limit, period_count);
+        let effective_limit = normalized_page_limit(limit);
+        let end = core::cmp::min(actual_start.saturating_add(effective_limit), period_count);
 
         let mut results = Vec::new(&env);
         for i in actual_start..end {
@@ -5144,3 +5183,17 @@ impl RevenueDepositContract {
         fixtures
     }
 }
+pub mod vesting;
+
+#[cfg(test)]
+mod vesting_test;
+
+#[cfg(test)]
+mod test_utils;
+
+#[cfg(test)]
+mod chunking_tests;
+mod test;
+mod test_auth;
+mod test_cross_contract;
+mod test_namespaces;
